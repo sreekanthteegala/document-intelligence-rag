@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Document Q&A</title>
+</head>
+<body>
+    <h2>Upload PDF</h2>
+<input type="file" id="pdfFile" />
+<button onclick="uploadPdf()">Upload</button>
+
+<p id="upload-status"></p>
+
+<script>
+async function uploadPdf() {
+    const fileInput = document.getElementById("pdfFile");
+    if (!fileInput.files.length) {
+        alert("Please select a PDF");
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append("file", fileInput.files[0]);
+
+    const res = await fetch("/upload", {
+        method: "POST",
+        body: formData
+    });
+
+    const data = await res.json();
+    document.getElementById("upload-status").innerText = data.message;
+}
+</script>
+
+
+    <hr>
+
+    <h2>Ask Question</h2>
+    <form id="qa-form">
+        <input type="text" id="question" size="60" />
+        <button type="submit">Ask</button>
+    </form>
+
+    <pre id="response"></pre>
+
+    <script>
+        document.getElementById("qa-form").onsubmit = async (e) => {
+            e.preventDefault();
+            const q = document.getElementById("question").value;
+
+            const res = await fetch("/ask", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({question: q})
+            });
+
+            const data = await res.json();
+            document.getElementById("response").innerText =
+                "Answer:\n" + data.answer + "\n\nSources:\n" + data.sources.join("\n---\n");
+        }
+    </script>
+</body>
+</html>
