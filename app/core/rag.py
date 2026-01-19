@@ -1,29 +1,18 @@
 from app.core.vectorstore import load_faiss
+from app.core.loader import load_pdf
+from app.config import UPLOAD_DIR
 import re
 
-_llm = None
+# ---------------- MODELS ----------------
+
 _summarizer = None
-
-
-def get_llm():
-    """Text generation model for Q&A"""
-    global _llm
-    if _llm is None:
-        from transformers import pipeline
-        _llm = pipeline(
-            "text2text-generation",
-            model="google/flan-t5-base",
-            device=-1
-        )
-    return _llm
+_qa_llm = None
 
 
 def get_summarizer():
-    """Dedicated summarization model"""
     global _summarizer
     if _summarizer is None:
         from transformers import pipeline
-        # Using BART - much better for summarization
         _summarizer = pipeline(
             "summarization",
             model="facebook/bart-large-cnn",
@@ -32,216 +21,170 @@ def get_summarizer():
     return _summarizer
 
 
+def get_qa_llm():
+    global _qa_llm
+    if _qa_llm is None:
+        from transformers import pipeline
+        _qa_llm = pipeline(
+            "text2text-generation",
+            model="google/flan-t5-base",
+            device=-1
+        )
+    return _qa_llm
+
+
+# ---------------- HELPERS ----------------
+
 def is_summary_question(question: str) -> bool:
-    """Detect if user wants a summary"""
     q = question.lower()
     return any(
-        phrase in q
-        for phrase in [
+        phrase in q for phrase in [
             "what is this pdf about",
             "what is this document about",
             "what is this paper about",
-            "what does this pdf say",
-            "what does this document say",
             "summary",
             "summarize",
-            "overview",
-            "about this",
-            "tell me about"
+            "overview"
         ]
     )
 
 
-def clean_email_noise(text: str) -> str:
-    """Remove email headers, footers, and repetitive noise"""
-    
-    # Remove email headers
-    text = re.sub(r'From:.*?\n', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'To:.*?\n', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'Subject:.*?\n', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'Date:.*?\n', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\d{1,2}/\d{1,2}/\d{2,4}', '', text)
-    
-    # Remove email footers and common phrases
-    noise_patterns = [
-        r'Please do not reply.*?monitored\.?',
-        r'Do not reply.*?monitored\.?',
-        r'To stop receiving.*?Profile\.?',
-        r'unsubscribe.*?',
-        r'privacy statement.*?',
-        r'microsoft corporation.*?',
-        r'one microsoft way.*?',
-        r'user profile.*?',
-        r'Dear.*?Greetings.*?\.',
-        r'With regards,.*',
-        r'Best regards,.*',
-        r'Sincerely,.*',
-        r'Organizing Committee.*',
-    ]
-    
-    for pattern in noise_patterns:
-        text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
-    
-    # Remove URLs
+def clean_text_light(text: str) -> str:
     text = re.sub(r'http\S+|www\.\S+', '', text)
-    
-    # Remove email addresses
-    text = re.sub(r'\S+@\S+', '', text)
-    
-    # Remove excessive whitespace
     text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'\n+', '\n', text)
-    
     return text.strip()
 
 
-def extract_meaningful_content(text: str) -> str:
-    """Extract the actual content from noisy text"""
-    
-    # Clean email noise first
-    text = clean_email_noise(text)
-    
-    # Split into sentences
-    sentences = re.split(r'[.!?]+', text)
-    
-    # Filter out noise sentences
-    meaningful = []
-    skip_phrases = [
-        'dear author', 'greetings from', 'please do not reply',
-        'organizing committee', 'user profile', 'future references',
-        'if you have any questions', 'look forward', 'with regards',
-        'follow the', 'check the box', 'stop receiving'
-    ]
-    
-    for sentence in sentences:
-        s = sentence.strip()
-        if len(s) < 15:  # Too short
-            continue
-        
-        # Skip noise sentences
-        if any(phrase in s.lower() for phrase in skip_phrases):
-            continue
-        
-        # Skip sentences with only numbers/dates
-        if re.match(r'^[\d\s/:.-]+$', s):
-            continue
-        
-        meaningful.append(s)
-    
-    # Join meaningful sentences
-    content = '. '.join(meaningful)
-    
-    # If content is too short, return original cleaned text
-    if len(content) < 50:
-        return text
-    
-    return content
+def mask_sensitive_entities(text: str) -> str:
+    # Mask full names (capitalized first + last names)
+    text = re.sub(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b', 'the candidate', text)
 
+    # Mask IDs / codes
+    text = re.sub(r'\b(ID|Id|id)[:\s]*\w+\b', 'an identifier', text)
+
+    # Mask dates
+    text = re.sub(r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b', 'a date', text)
+
+    # Normalize second-person language
+    text = re.sub(r'\byou\b', 'the recipient', text, flags=re.IGNORECASE)
+    text = re.sub(r'\byour\b', 'their', text, flags=re.IGNORECASE)
+
+    return text
+
+
+def detect_document_type(text: str) -> str:
+    t = text.lower()
+
+    if any(k in t for k in ["abstract", "introduction", "methodology", "references"]):
+        return "research_paper"
+
+    if any(k in t for k in ["offer letter", "letter of intent", "employment", "joining"]):
+        return "employment_document"
+
+    if any(k in t for k in ["invoice", "amount due", "bill to"]):
+        return "invoice"
+
+    if any(k in t for k in ["dear", "regards", "sincerely"]):
+        return "letter_or_email"
+
+    return "generic"
+
+
+def build_summary_prompt(doc_type: str, text: str) -> str:
+    prompts = {
+        "research_paper":
+            "Summarize the main objective and contribution of this research paper:\n\n",
+
+        "employment_document":
+            "Summarize the purpose of this employment-related document:\n\n",
+
+        "letter_or_email":
+            "Summarize the key message of this letter or email:\n\n",
+
+        "invoice":
+            "Summarize what this billing document is about:\n\n",
+
+        "generic":
+            "Summarize the main topic and purpose of this document:\n\n"
+    }
+
+    return prompts.get(doc_type, prompts["generic"]) + text
+
+
+# ---------------- MAIN ENTRY ----------------
 
 def answer_question(question: str):
-    db = load_faiss()
+    """
+    Summary → Intent-aware direct summarization (NO RAG)
+    QA → RAG + QA model
+    """
 
     # 🔹 SUMMARY MODE
     if is_summary_question(question):
-        # Get more chunks for better context
-        docs = db.similarity_search("main content key information", k=10)
-        
-        if not docs:
-            return "No document content found.", []
-        
-        # Combine all text
-        raw_text = " ".join(d.page_content for d in docs)
-        
-        # Extract meaningful content
-        cleaned_text = extract_meaningful_content(raw_text)
-        
-        # Limit to reasonable length for summarization
-        max_length = 1024
-        if len(cleaned_text) > max_length:
-            cleaned_text = cleaned_text[:max_length]
-        
-        # If cleaned text is too short, there's no content
-        if len(cleaned_text) < 100:
-            return "Unable to generate a meaningful summary from the document.", []
-        
-        try:
-            # Use dedicated summarizer
-            summarizer = get_summarizer()
-            
-            summary = summarizer(
-                cleaned_text,
-                max_length=130,
-                min_length=40,
-                do_sample=False,
-                truncation=True
-            )[0]['summary_text']
-            
-            # Clean up summary
-            summary = summary.strip()
-            if not summary.endswith('.'):
-                summary += '.'
-            
-            return summary, []
-            
-        except Exception as e:
-            print(f"Summarization error: {e}")
-            
-            # Fallback: Use extractive summary (first few meaningful sentences)
-            sentences = re.split(r'[.!?]+', cleaned_text)
-            meaningful_sentences = [s.strip() for s in sentences if len(s.strip()) > 20][:3]
-            
-            if meaningful_sentences:
-                fallback_summary = '. '.join(meaningful_sentences) + '.'
-                return fallback_summary, []
-            
-            return "Unable to generate summary. Please try a specific question about the document.", []
+        pdf_files = sorted(
+            UPLOAD_DIR.glob("*.pdf"),
+            key=lambda x: x.stat().st_mtime,
+            reverse=True
+        )
 
-    # 🔹 NORMAL QA MODE
-    docs = db.similarity_search(question, k=4)
-    
-    if not docs:
-        return "I don't have enough information to answer this question.", []
-    
-    # Clean context
-    context_parts = []
-    for doc in docs:
-        cleaned = extract_meaningful_content(doc.page_content)
-        if cleaned and len(cleaned) > 30:
-            context_parts.append(cleaned)
-    
-    context = " ".join(context_parts[:3])  # Limit to top 3
-    
-    if not context:
-        return "I don't have relevant information to answer this question.", []
-    
-    llm = get_llm()
-    
-    prompt = f"""Answer the question based on the following context. Be concise and specific.
+        if not pdf_files:
+            return "No document uploaded.", []
 
-Context: {context}
+        raw_text = load_pdf(str(pdf_files[0]))
+        if not raw_text:
+            return "Document is empty.", []
 
-Question: {question}
+        # Take only document-intent region
+        raw_text = raw_text[:900]
+        raw_text = clean_text_light(raw_text)
+        raw_text = mask_sensitive_entities(raw_text)
 
-Answer:"""
-    
-    try:
-        output = llm(
+        doc_type = detect_document_type(raw_text)
+        prompt = build_summary_prompt(doc_type, raw_text)
+
+        summarizer = get_summarizer()
+        summary = summarizer(
             prompt,
-            max_new_tokens=150,
-            temperature=0.3,
-            do_sample=True
-        )[0]["generated_text"]
-        
-        output = output.strip()
-        
-        # Check for non-answers
-        if any(phrase in output.lower() for phrase in ['i don\'t know', 'not mentioned', 'no information']):
-            return "I don't have enough information to answer this question.", []
-        
-        sources = [doc.page_content[:200] for doc in docs[:2]]
-        
-        return output, sources
-        
-    except Exception as e:
-        print(f"Generation error: {e}")
-        return "Error generating answer. Please try rephrasing your question.", []
+            max_length=140,
+            min_length=50,
+            do_sample=False
+        )[0]["summary_text"]
+
+        return summary.strip(), []
+
+    # 🔹 QA MODE (RAG)
+    db = load_faiss()
+    docs = db.similarity_search(question, k=3)
+
+    if not docs:
+        return "I don't know", []
+
+    context = clean_text_light(" ".join(d.page_content for d in docs))
+
+    llm = get_qa_llm()
+    prompt = f"""
+Answer the question using ONLY the context below.
+If the answer is not present, say "I don't know".
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+
+    output = llm(
+        prompt,
+        max_new_tokens=150,
+        temperature=0.2,
+        do_sample=False
+    )[0]["generated_text"]
+
+    if "i don't know" in output.lower():
+        return "I don't know", []
+
+    sources = [doc.page_content[:200] for doc in docs]
+
+    return output.strip(), sources
